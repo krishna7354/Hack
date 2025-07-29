@@ -1,7 +1,6 @@
-flask
+Flask
 flask-cors
-requests
 google-generativeai
 numpy
-pypdf2
-gunicorn
+PyPDF2
+requests
