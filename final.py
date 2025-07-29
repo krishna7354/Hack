@@ -14,9 +14,6 @@ from typing import List
 import time
 
 # --- Configuration ---
-# FOR LOCAL TESTING ONLY. DO NOT SHARE THIS CODE WITH KEYS IN IT.
-# ---
-# Replace with your actual Google API Key
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 HACKRX_API_KEY = os.getenv('HACKRX_API_KEY')
 
@@ -31,8 +28,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 try:
     if GOOGLE_API_KEY:
         genai.configure(api_key=GOOGLE_API_KEY)
-        # Use flash for memory efficiency, but with better config
-        GEMINI_MODEL = genai.GenerativeModel('gemini-1.5-flash')
+        # Use Pro for better accuracy while staying memory efficient
+        GEMINI_MODEL = genai.GenerativeModel('gemini-1.5-pro')
         logging.info("Google Gemini model configured successfully.")
     else:
         GEMINI_MODEL = None
@@ -93,63 +90,72 @@ class MemoryEfficientDocumentProcessor:
             logging.error(f"Error processing PDF {file_path}: {e}")
         return chunks
 
-# -----------------------------------------------------------------------------
-# ------------------ UPDATED SEMANTIC RETRIEVER WITH FAISS --------------------
-# -----------------------------------------------------------------------------
-class SemanticRetriever:
-    """
-    Creates a FAISS index for document chunks and retrieves relevant chunks for a query.
-    """
-    def __init__(self, chunks: List[str], model):
+class MemoryEfficientRetriever:
+    def __init__(self, chunks: List[str]):
         self.chunks = chunks
-        self.model = model
-        self.index = None
-        self.embeddings = self._embed_chunks()
-        if self.embeddings is not None:
-            self._build_faiss_index()
+        self.embeddings = None
+        self._generate_embeddings()
 
-    def _embed_chunks(self) -> np.ndarray:
-        """Creates embeddings for all document chunks."""
-        if not self.chunks or self.model is None:
-            return None
-        logging.info(f"Creating embeddings for {len(self.chunks)} chunks...")
-        embeddings = self.model.encode(self.chunks, show_progress_bar=False)
-        logging.info("Embeddings created successfully.")
-        return embeddings.astype('float32') # FAISS requires float32
-
-    def _build_faiss_index(self):
-        """Builds a FAISS index from the document embeddings."""
-        if self.embeddings is None:
-            logging.warning("Embeddings are not available, skipping FAISS index build.")
+    def _generate_embeddings(self):
+        """Generate embeddings in small batches to save memory"""
+        if not self.chunks:
             return
+        
+        logging.info(f"Generating embeddings for {len(self.chunks)} chunks...")
+        try:
+            # Process in very small batches to save memory
+            batch_size = 20  # Reduced from 100
+            all_embeddings = []
             
-        dimension = self.embeddings.shape[1]
-        logging.info(f"Building FAISS index with dimension {dimension}...")
-        
-        # Using IndexFlatL2 for simple Euclidean distance search.
-        # IndexFlatIP for dot product (cosine similarity) is also a good choice.
-        self.index = faiss.IndexFlatL2(dimension)
-        self.index.add(self.embeddings)
-        logging.info(f"FAISS index built successfully with {self.index.ntotal} vectors.")
-
-    def get_relevant_context(self, query: str, top_k: int = 5) -> str:
-        """Finds the most relevant chunks for a given query using FAISS."""
-        if self.index is None:
-            return "Error: FAISS index is not available."
+            for i in range(0, len(self.chunks), batch_size):
+                batch = self.chunks[i:i+batch_size]
+                result = genai.embed_content(
+                    model='models/embedding-001',  # Use older model - more memory efficient
+                    content=batch,
+                    task_type="RETRIEVAL_DOCUMENT"
+                )
+                
+                if isinstance(result['embedding'][0], list):
+                    all_embeddings.extend(result['embedding'])
+                else:
+                    all_embeddings.append(result['embedding'])
+                
+                # Force garbage collection after each batch
+                gc.collect()
             
-        query_embedding = self.model.encode([query]).astype('float32')
-        
-        # Search the FAISS index
-        distances, indices = self.index.search(query_embedding, top_k)
-        
-        # Retrieve the actual chunk text using the indices
-        relevant_context = "\n---\n".join([self.chunks[i] for i in indices[0] if i != -1])
-        return relevant_context
-# -----------------------------------------------------------------------------
-# ------------------------- END OF UPDATED SECTION ----------------------------
-# -----------------------------------------------------------------------------
+            self.embeddings = np.array(all_embeddings, dtype=np.float32)  # Use float32 instead of float64
+            logging.info("Embeddings generated successfully")
+        except Exception as e:
+            logging.error(f"Failed to generate embeddings: {e}")
+            self.embeddings = None
 
-class AnsweringEngine:
+    def get_relevant_context(self, query: str, top_k: int = 3) -> str:
+        if self.embeddings is None:
+            return "Error: Document embeddings not available."
+        
+        try:
+            result = genai.embed_content(
+                model='models/embedding-001',
+                content=query,
+                task_type="RETRIEVAL_QUERY"
+            )
+            query_embedding = np.array(result['embedding'], dtype=np.float32)
+            
+            # Compute similarities efficiently
+            similarities = np.dot(self.embeddings, query_embedding.T).flatten()
+            top_indices = np.argsort(similarities)[::-1][:top_k]
+            
+            relevant_chunks = [self.chunks[i] for i in top_indices if similarities[i] > 0.2]
+            
+            if not relevant_chunks:
+                return "No relevant information found."
+            
+            return "\n---\n".join(relevant_chunks)
+        except Exception as e:
+            logging.error(f"Error in retrieval: {e}")
+            return f"Error during search: {e}"
+
+class OptimizedAnsweringEngine:
     def __init__(self, model):
         self.model = model
 
@@ -173,8 +179,9 @@ ANSWER:"""
             response = self.model.generate_content(
                 prompt,
                 generation_config=genai.types.GenerationConfig(
-                    temperature=0.1,
-                    max_output_tokens=200,  # Shorter responses
+                    temperature=0.05,  # Even lower for more precise policy answers
+                    max_output_tokens=300,  # Slightly longer for detailed policy info
+                    top_p=0.8,  # Add top_p for better consistency
                 )
             )
             return response.text.strip()
@@ -219,9 +226,12 @@ def check_authentication():
 
 @app.route('/hackrx/run', methods=['POST'])
 def run_hackrx():
-    # ... (This function remains the same)
-    if not GEMINI_MODEL or not EMBEDDING_MODEL:
-        return jsonify({'error': 'System not initialized. Models are not loaded.'}), 503
+    start_time = time.time()
+    initial_memory = get_memory_usage()
+    
+    if not GEMINI_MODEL:
+        return jsonify({'error': 'System not initialized. LLM model is not loaded.'}), 503
+    
     data = request.get_json()
     if not data or 'documents' not in data or 'questions' not in data:
         return jsonify({'error': 'Invalid request body. "documents" and "questions" fields are required.'}), 400
@@ -231,6 +241,12 @@ def run_hackrx():
 
     if not isinstance(questions, list) or not all(isinstance(q, str) for q in questions):
         return jsonify({'error': '"questions" must be a list of strings.'}), 400
+
+    # Limit questions to prevent memory issues
+    if len(questions) > 15:
+        questions = questions[:15]
+        logging.warning("Limited to first 15 questions for memory efficiency")
+
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     tmp_path = tmp.name
     tmp.close()
@@ -239,24 +255,68 @@ def run_hackrx():
         # Process document with memory efficiency
         processor = MemoryEfficientDocumentProcessor()
         if not processor.download_file(doc_url, tmp_path):
-            return jsonify({'error': f'Failed to download or access the document from URL: {doc_url}'}), 500
-        document_chunks = processor.process_pdf(tmp_path)
+            return jsonify({'error': f'Failed to download document from URL: {doc_url}'}), 500
+        
+        logging.info(f"Download completed. Memory: {get_memory_usage():.1f}MB")
+        
+        document_chunks = processor.process_pdf_streaming(tmp_path)
         if not document_chunks:
-            return jsonify({'error': 'Failed to extract any text from the provided document.'}), 500
-        retriever = SemanticRetriever(document_chunks, EMBEDDING_MODEL)
-        answer_engine = AnsweringEngine(GEMINI_MODEL)
+            return jsonify({'error': 'Failed to extract text from document.'}), 500
+
+        logging.info(f"Processing completed. Memory: {get_memory_usage():.1f}MB")
+
+        # Create retriever with memory monitoring
+        retriever = MemoryEfficientRetriever(document_chunks)
+        if retriever.embeddings is None:
+            return jsonify({'error': 'Failed to generate document embeddings.'}), 500
+            
+        logging.info(f"Embeddings completed. Memory: {get_memory_usage():.1f}MB")
+
+        answer_engine = OptimizedAnsweringEngine(GEMINI_MODEL)
+        
+        # Process questions with limited parallelism for memory control
+        max_workers = min(3, len(questions))  # Limit concurrent threads
         answers = []
-        for question in questions:
-            logging.info(f"Processing question: '{question}'")
-            context = retriever.get_relevant_context(question)
-            answer = answer_engine.get_answer(question, context)
-            answers.append(answer)
-        logging.info("Successfully answered all questions.")
-        return jsonify({'answers': answers})
+        
+        # Split questions into smaller batches
+        batch_size = 5
+        for i in range(0, len(questions), batch_size):
+            batch_questions = questions[i:i+batch_size]
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(answer_engine.get_answer, q, retriever.get_relevant_context(q))
+                    for q in batch_questions
+                ]
+                
+                for future in futures:
+                    try:
+                        answer = future.result(timeout=30)
+                        answers.append(answer)
+                    except Exception as exc:
+                        logging.error(f"Question processing error: {exc}")
+                        answers.append(f"Error: {str(exc)[:50]}")
+            
+            # Clean up between batches
+            gc.collect()
+            logging.info(f"Batch {i//batch_size + 1} completed. Memory: {get_memory_usage():.1f}MB")
+        
+        total_time = time.time() - start_time
+        final_memory = get_memory_usage()
+        
+        logging.info(f"All questions processed in {total_time:.2f}s. Peak memory: {final_memory:.1f}MB")
+        
+        return jsonify({
+            'answers': answers,
+            'processing_time': f"{total_time:.2f}s",
+            'memory_used': f"{final_memory:.1f}MB"
+        })
+
     except Exception as e:
         logging.error(f"Unexpected error: {e}")
         logging.error(traceback.format_exc())
-        return jsonify({'error': f'An internal server error occurred: {e}'}), 500
+        return jsonify({'error': f'Internal server error: {str(e)[:100]}'}), 500
+    
     finally:
         # Cleanup
         if os.path.exists(tmp_path):
@@ -268,9 +328,10 @@ def run_hackrx():
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    # ... (This function remains the same)
+    memory_usage = get_memory_usage()
     return jsonify({
-        'status': 'healthy' if GEMINI_MODEL and EMBEDDING_MODEL else 'degraded',
+        'status': 'healthy' if GEMINI_MODEL else 'degraded',
+        'memory_usage_mb': f"{memory_usage:.1f}",
         'models_loaded': {
             'gemini': 'available' if GEMINI_MODEL else 'unavailable'
         }
