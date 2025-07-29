@@ -2,9 +2,6 @@ flask
 flask-cors
 requests
 google-generativeai
-sentence-transformers
 numpy
-scikit-learn
 pypdf2
-faiss-cpu
 gunicorn
