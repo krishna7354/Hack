@@ -1,24 +1,19 @@
 import os
 import traceback
 import logging
-import faiss  # Import FAISS
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import google.generativeai as genai
 import numpy as np
-from sentence_transformers import SentenceTransformer
 import PyPDF2
 import requests
 import tempfile
 from typing import List
 
 # --- Configuration ---
-# FOR LOCAL TESTING ONLY. DO NOT SHARE THIS CODE WITH KEYS IN IT.
-# ---
-# Replace with your actual Google API Key
+# This secure version reads keys from the environment variables on your server.
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 HACKRX_API_KEY = os.getenv('HACKRX_API_KEY')
-# ---
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
@@ -36,13 +31,9 @@ try:
     else:
         GEMINI_MODEL = None
         logging.warning("GOOGLE_API_KEY not found. Q&A functionality will be disabled.")
-    
-    logging.info("SentenceTransformer embedding model loaded successfully.")
-
 except Exception as e:
     logging.error(f"Failed to initialize models: {e}")
     GEMINI_MODEL = None
-    EMBEDDING_MODEL = None
 
 # --- Core Logic Classes ---
 
@@ -74,22 +65,16 @@ class DocumentProcessor:
             logging.error(f"Error processing PDF {file_path}: {e}")
         return chunks
 
-# -----------------------------------------------------------------------------
-# ------------------ UPDATED SEMANTIC RETRIEVER WITH FAISS --------------------
-# -----------------------------------------------------------------------------
-# --- UPDATED SEMANTIC RETRIEVER (API-BASED) ---
 class SemanticRetriever:
     def __init__(self, chunks: List[str]):
         self.chunks = chunks
         self.embeddings = self._embed_chunks_via_api()
 
     def _embed_chunks_via_api(self) -> np.ndarray:
-        """Creates embeddings for all chunks using the Google API."""
         if not self.chunks:
             return None
         logging.info(f"Getting embeddings for {len(self.chunks)} chunks via API...")
         try:
-            # Use the Google API to get embeddings for the document chunks
             result = genai.embed_content(
                 model='models/embedding-001',
                 content=self.chunks,
@@ -102,30 +87,22 @@ class SemanticRetriever:
             return None
 
     def get_relevant_context(self, query: str, top_k: int = 5) -> str:
-        """Finds the most relevant chunks for a given query."""
         if self.embeddings is None:
             return "Error: Document embeddings are not available."
         try:
-            # Use the Google API to get an embedding for the query
             result = genai.embed_content(
                 model='models/embedding-001',
                 content=query,
                 task_type="RETRIEVAL_QUERY"
             )
             query_embedding = np.array(result['embedding'])
-
-            # Perform a simple similarity search with numpy
             similarities = np.dot(self.embeddings, query_embedding.T).flatten()
             top_indices = np.argsort(similarities)[::-1][:top_k]
-
             relevant_context = "\n---\n".join([self.chunks[i] for i in top_indices])
             return relevant_context
         except Exception as e:
             logging.error(f"Failed to get query embedding or perform search: {e}")
             return f"Error during search: {e}"
-# -----------------------------------------------------------------------------
-# ------------------------- END OF UPDATED SECTION ----------------------------
-# -----------------------------------------------------------------------------
 
 class AnsweringEngine:
     def __init__(self, model):
@@ -158,45 +135,65 @@ class AnsweringEngine:
 # --- API Endpoints ---
 @app.before_request
 def check_authentication():
-    # ... (This function remains the same)
-    pass # Placeholder for brevity
+    if request.endpoint == 'run_hackrx':
+        if not HACKRX_API_KEY:
+            logging.warning("HACKRX_API_KEY not set. Allowing request without authentication.")
+            return
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Authorization header is missing or does not contain a Bearer token'}), 401
+        token = auth_header.split(' ')[1]
+        if token != HACKRX_API_KEY:
+            return jsonify({'error': 'Invalid API Key'}), 403
 
 @app.route('/hackrx/run', methods=['POST'])
 def run_hackrx():
-    # ... (This function remains the same)
-    if not GEMINI_MODEL or not EMBEDDING_MODEL:
-        return jsonify({'error': 'System not initialized. Models are not loaded.'}), 503
+    # This check is now simpler and correct
+    if not GEMINI_MODEL:
+        return jsonify({'error': 'System not initialized. LLM model is not loaded.'}), 503
+    
     data = request.get_json()
     if not data or 'documents' not in data or 'questions' not in data:
         return jsonify({'error': 'Invalid request body. "documents" and "questions" fields are required.'}), 400
+    
     doc_url = data['documents']
     questions = data['questions']
+
     if not isinstance(questions, list) or not all(isinstance(q, str) for q in questions):
         return jsonify({'error': '"questions" must be a list of strings.'}), 400
+
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     tmp_path = tmp.name
     tmp.close()
+
     try:
         processor = DocumentProcessor()
         if not processor.download_file(doc_url, tmp_path):
             return jsonify({'error': f'Failed to download or access the document from URL: {doc_url}'}), 500
+        
         document_chunks = processor.process_pdf(tmp_path)
+
         if not document_chunks:
             return jsonify({'error': 'Failed to extract any text from the provided document.'}), 500
+
         retriever = SemanticRetriever(document_chunks)
         answer_engine = AnsweringEngine(GEMINI_MODEL)
+        
         answers = []
         for question in questions:
             logging.info(f"Processing question: '{question}'")
             context = retriever.get_relevant_context(question)
             answer = answer_engine.get_answer(question, context)
             answers.append(answer)
+        
         logging.info("Successfully answered all questions.")
         return jsonify({'answers': answers})
+
     except Exception as e:
         logging.error(f"An unexpected error occurred during processing: {e}")
         logging.error(traceback.format_exc())
         return jsonify({'error': f'An internal server error occurred: {e}'}), 500
+    
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -204,12 +201,10 @@ def run_hackrx():
         
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    # ... (This function remains the same)
     return jsonify({
-        'status': 'healthy' if GEMINI_MODEL and EMBEDDING_MODEL else 'degraded',
+        'status': 'healthy' if GEMINI_MODEL else 'degraded',
         'models_loaded': {
-            'gemini': 'available' if GEMINI_MODEL else 'unavailable',
-            'embedding': 'available' if EMBEDDING_MODEL else 'unavailable'
+            'gemini': 'available' if GEMINI_MODEL else 'unavailable'
         }
     })
 
