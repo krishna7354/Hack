@@ -37,7 +37,6 @@ try:
         GEMINI_MODEL = None
         logging.warning("GOOGLE_API_KEY not found. Q&A functionality will be disabled.")
     
-    EMBEDDING_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
     logging.info("SentenceTransformer embedding model loaded successfully.")
 
 except Exception as e:
@@ -78,55 +77,52 @@ class DocumentProcessor:
 # -----------------------------------------------------------------------------
 # ------------------ UPDATED SEMANTIC RETRIEVER WITH FAISS --------------------
 # -----------------------------------------------------------------------------
+# --- UPDATED SEMANTIC RETRIEVER (API-BASED) ---
 class SemanticRetriever:
-    """
-    Creates a FAISS index for document chunks and retrieves relevant chunks for a query.
-    """
-    def __init__(self, chunks: List[str], model):
+    def __init__(self, chunks: List[str]):
         self.chunks = chunks
-        self.model = model
-        self.index = None
-        self.embeddings = self._embed_chunks()
-        if self.embeddings is not None:
-            self._build_faiss_index()
+        self.embeddings = self._embed_chunks_via_api()
 
-    def _embed_chunks(self) -> np.ndarray:
-        """Creates embeddings for all document chunks."""
-        if not self.chunks or self.model is None:
+    def _embed_chunks_via_api(self) -> np.ndarray:
+        """Creates embeddings for all chunks using the Google API."""
+        if not self.chunks:
             return None
-        logging.info(f"Creating embeddings for {len(self.chunks)} chunks...")
-        embeddings = self.model.encode(self.chunks, show_progress_bar=False)
-        logging.info("Embeddings created successfully.")
-        return embeddings.astype('float32') # FAISS requires float32
-
-    def _build_faiss_index(self):
-        """Builds a FAISS index from the document embeddings."""
-        if self.embeddings is None:
-            logging.warning("Embeddings are not available, skipping FAISS index build.")
-            return
-            
-        dimension = self.embeddings.shape[1]
-        logging.info(f"Building FAISS index with dimension {dimension}...")
-        
-        # Using IndexFlatL2 for simple Euclidean distance search.
-        # IndexFlatIP for dot product (cosine similarity) is also a good choice.
-        self.index = faiss.IndexFlatL2(dimension)
-        self.index.add(self.embeddings)
-        logging.info(f"FAISS index built successfully with {self.index.ntotal} vectors.")
+        logging.info(f"Getting embeddings for {len(self.chunks)} chunks via API...")
+        try:
+            # Use the Google API to get embeddings for the document chunks
+            result = genai.embed_content(
+                model='models/embedding-001',
+                content=self.chunks,
+                task_type="RETRIEVAL_DOCUMENT"
+            )
+            logging.info("API embeddings received successfully.")
+            return np.array(result['embedding'])
+        except Exception as e:
+            logging.error(f"Failed to get embeddings from API: {e}")
+            return None
 
     def get_relevant_context(self, query: str, top_k: int = 5) -> str:
-        """Finds the most relevant chunks for a given query using FAISS."""
-        if self.index is None:
-            return "Error: FAISS index is not available."
-            
-        query_embedding = self.model.encode([query]).astype('float32')
-        
-        # Search the FAISS index
-        distances, indices = self.index.search(query_embedding, top_k)
-        
-        # Retrieve the actual chunk text using the indices
-        relevant_context = "\n---\n".join([self.chunks[i] for i in indices[0] if i != -1])
-        return relevant_context
+        """Finds the most relevant chunks for a given query."""
+        if self.embeddings is None:
+            return "Error: Document embeddings are not available."
+        try:
+            # Use the Google API to get an embedding for the query
+            result = genai.embed_content(
+                model='models/embedding-001',
+                content=query,
+                task_type="RETRIEVAL_QUERY"
+            )
+            query_embedding = np.array(result['embedding'])
+
+            # Perform a simple similarity search with numpy
+            similarities = np.dot(self.embeddings, query_embedding.T).flatten()
+            top_indices = np.argsort(similarities)[::-1][:top_k]
+
+            relevant_context = "\n---\n".join([self.chunks[i] for i in top_indices])
+            return relevant_context
+        except Exception as e:
+            logging.error(f"Failed to get query embedding or perform search: {e}")
+            return f"Error during search: {e}"
 # -----------------------------------------------------------------------------
 # ------------------------- END OF UPDATED SECTION ----------------------------
 # -----------------------------------------------------------------------------
@@ -187,7 +183,7 @@ def run_hackrx():
         document_chunks = processor.process_pdf(tmp_path)
         if not document_chunks:
             return jsonify({'error': 'Failed to extract any text from the provided document.'}), 500
-        retriever = SemanticRetriever(document_chunks, EMBEDDING_MODEL)
+        retriever = SemanticRetriever(document_chunks)
         answer_engine = AnsweringEngine(GEMINI_MODEL)
         answers = []
         for question in questions:
