@@ -2,6 +2,7 @@ import os
 import traceback
 import logging
 import gc
+import time
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -11,7 +12,6 @@ import PyPDF2
 import requests
 import tempfile
 from typing import List
-import time
 
 # --- Configuration ---
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
@@ -28,8 +28,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 try:
     if GOOGLE_API_KEY:
         genai.configure(api_key=GOOGLE_API_KEY)
-        # Use Pro for better accuracy while staying memory efficient
-        GEMINI_MODEL = genai.GenerativeModel('gemini-1.5-pro')
+        # Use flash model for better rate limits
+        GEMINI_MODEL = genai.GenerativeModel('gemini-1.5-flash')
         logging.info("Google Gemini model configured successfully.")
     else:
         GEMINI_MODEL = None
@@ -38,16 +38,39 @@ except Exception as e:
     logging.error(f"Failed to initialize models: {e}")
     GEMINI_MODEL = None
 
+# --- Rate Limiting Helper ---
+class RateLimiter:
+    def __init__(self, max_calls_per_minute=15):
+        self.max_calls = max_calls_per_minute
+        self.calls = []
+    
+    def wait_if_needed(self):
+        now = time.time()
+        # Remove calls older than 1 minute
+        self.calls = [call_time for call_time in self.calls if now - call_time < 60]
+        
+        if len(self.calls) >= self.max_calls:
+            # Wait until the oldest call is more than 1 minute old
+            wait_time = 60 - (now - self.calls[0]) + 0.1  # Add small buffer
+            if wait_time > 0:
+                logging.info(f"Rate limit reached, waiting {wait_time:.1f} seconds...")
+                time.sleep(wait_time)
+                self.calls = self.calls[1:]  # Remove the oldest call
+        
+        self.calls.append(now)
+
+# Global rate limiter
+rate_limiter = RateLimiter(max_calls_per_minute=10)  # Conservative limit
+
 # --- Memory-Optimized Core Logic Classes ---
 
 class MemoryEfficientDocumentProcessor:
     def download_file(self, url: str, target_path: str) -> bool:
         try:
-            # Use stream with smaller chunk size to reduce memory usage
             response = requests.get(url, stream=True, timeout=30)
             response.raise_for_status()
             with open(target_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=4096):  # Smaller chunks
+                for chunk in response.iter_content(chunk_size=4096):
                     f.write(chunk)
             logging.info(f"Successfully downloaded file from {url}")
             return True
@@ -66,23 +89,21 @@ class MemoryEfficientDocumentProcessor:
                 for i, page in enumerate(reader.pages):
                     text = page.extract_text()
                     if text and text.strip():
-                        # Clean and split text more aggressively to save memory
                         cleaned_text = ' '.join(text.strip().split())
                         
-                        # Smaller chunks (300 words) to reduce memory footprint
+                        # Larger chunks to reduce API calls (500 words instead of 300)
                         words = cleaned_text.split()
-                        for j in range(0, len(words), 300):
-                            chunk = ' '.join(words[j:j+300])
+                        for j in range(0, len(words), 500):
+                            chunk = ' '.join(words[j:j+500])
                             if chunk.strip():
-                                chunks.append(f"[P{i+1}S{j//300+1}] {chunk}")
+                                chunks.append(f"[P{i+1}S{j//500+1}] {chunk}")
                     
-                    # Force garbage collection every 5 pages
                     if (i + 1) % 5 == 0:
                         gc.collect()
                         
-                    # Limit total chunks to prevent memory overflow (max ~100 chunks)
-                    if len(chunks) >= 100:
-                        logging.warning(f"Limiting chunks to 100 for memory efficiency")
+                    # Limit total chunks to prevent too many API calls
+                    if len(chunks) >= 50:  # Reduced from 100
+                        logging.warning(f"Limiting chunks to 50 for API efficiency")
                         break
                         
             logging.info(f"Processed {len(chunks)} chunks from {total_pages} pages")
@@ -97,34 +118,50 @@ class MemoryEfficientRetriever:
         self._generate_embeddings()
 
     def _generate_embeddings(self):
-        """Generate embeddings in small batches to save memory"""
+        """Generate embeddings in small batches with rate limiting"""
         if not self.chunks:
             return
         
         logging.info(f"Generating embeddings for {len(self.chunks)} chunks...")
         try:
-            # Process in very small batches to save memory
-            batch_size = 20  # Reduced from 100
+            # Process in very small batches with rate limiting
+            batch_size = 5  # Much smaller batches
             all_embeddings = []
             
             for i in range(0, len(self.chunks), batch_size):
                 batch = self.chunks[i:i+batch_size]
-                result = genai.embed_content(
-                    model='models/embedding-001',  # Use older model - more memory efficient
-                    content=batch,
-                    task_type="RETRIEVAL_DOCUMENT"
-                )
                 
-                if isinstance(result['embedding'][0], list):
-                    all_embeddings.extend(result['embedding'])
-                else:
-                    all_embeddings.append(result['embedding'])
+                # Apply rate limiting before each API call
+                rate_limiter.wait_if_needed()
                 
-                # Force garbage collection after each batch
+                try:
+                    result = genai.embed_content(
+                        model='models/text-embedding-004',  # Use latest embedding model
+                        content=batch,
+                        task_type="RETRIEVAL_DOCUMENT"
+                    )
+                    
+                    if isinstance(result['embedding'][0], list):
+                        all_embeddings.extend(result['embedding'])
+                    else:
+                        all_embeddings.append(result['embedding'])
+                    
+                    logging.info(f"Processed embedding batch {i//batch_size + 1}/{(len(self.chunks) + batch_size - 1)//batch_size}")
+                    
+                except Exception as e:
+                    logging.error(f"Error in embedding batch {i//batch_size + 1}: {e}")
+                    # Continue with next batch instead of failing completely
+                    continue
+                
                 gc.collect()
             
-            self.embeddings = np.array(all_embeddings, dtype=np.float32)  # Use float32 instead of float64
-            logging.info("Embeddings generated successfully")
+            if all_embeddings:
+                self.embeddings = np.array(all_embeddings, dtype=np.float32)
+                logging.info("Embeddings generated successfully")
+            else:
+                logging.error("No embeddings were generated")
+                self.embeddings = None
+                
         except Exception as e:
             logging.error(f"Failed to generate embeddings: {e}")
             self.embeddings = None
@@ -134,14 +171,16 @@ class MemoryEfficientRetriever:
             return "Error: Document embeddings not available."
         
         try:
+            # Apply rate limiting before query embedding
+            rate_limiter.wait_if_needed()
+            
             result = genai.embed_content(
-                model='models/embedding-001',
+                model='models/text-embedding-004',
                 content=query,
                 task_type="RETRIEVAL_QUERY"
             )
             query_embedding = np.array(result['embedding'], dtype=np.float32)
             
-            # Compute similarities efficiently
             similarities = np.dot(self.embeddings, query_embedding.T).flatten()
             top_indices = np.argsort(similarities)[::-1][:top_k]
             
@@ -163,11 +202,10 @@ class OptimizedAnsweringEngine:
         if not self.model:
             return "Error: Model not available."
         
-        # Shorter, more focused prompt to reduce token usage
         prompt = f"""Based ONLY on this policy context, answer the question precisely:
 
 CONTEXT:
-{context[:2000]}  # Limit context length to save memory
+{context[:3000]}  # Increased context length for better answers
 
 QUESTION: {question}
 
@@ -176,29 +214,23 @@ Answer with exact policy details (amounts, periods, conditions). If not in conte
 ANSWER:"""
         
         try:
+            # Apply rate limiting before generation
+            rate_limiter.wait_if_needed()
+            
             response = self.model.generate_content(
                 prompt,
                 generation_config=genai.types.GenerationConfig(
-                    temperature=0.05,  # Even lower for more precise policy answers
-                    max_output_tokens=300,  # Slightly longer for detailed policy info
-                    top_p=0.8,  # Add top_p for better consistency
+                    temperature=0.1,
+                    max_output_tokens=400,
+                    top_p=0.9,
                 )
             )
             return response.text.strip()
         except Exception as e:
             logging.error(f"Error generating answer: {e}")
-            return f"Error: {str(e)[:100]}"  # Truncate error messages
-
-    def process_question_batch(self, questions: List[str], retriever: MemoryEfficientRetriever) -> List[str]:
-        """Process questions in batch to reduce API calls"""
-        answers = []
-        for question in questions:
-            context = retriever.get_relevant_context(question)
-            answer = self.get_answer(question, context)
-            answers.append(answer)
-            # Clean up after each question
-            gc.collect()
-        return answers
+            if "429" in str(e) or "quota" in str(e).lower():
+                return "Error: API rate limit exceeded. Please try again later."
+            return f"Error: {str(e)[:100]}"
 
 # --- Memory Monitoring ---
 def get_memory_usage():
@@ -242,17 +274,16 @@ def run_hackrx():
     if not isinstance(questions, list) or not all(isinstance(q, str) for q in questions):
         return jsonify({'error': '"questions" must be a list of strings.'}), 400
 
-    # Limit questions to prevent memory issues
-    if len(questions) > 15:
-        questions = questions[:15]
-        logging.warning("Limited to first 15 questions for memory efficiency")
+    # Limit questions to prevent rate limit issues
+    if len(questions) > 10:  # Reduced from 15
+        questions = questions[:10]
+        logging.warning("Limited to first 10 questions for API efficiency")
 
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     tmp_path = tmp.name
     tmp.close()
 
     try:
-        # Process document with memory efficiency
         processor = MemoryEfficientDocumentProcessor()
         if not processor.download_file(doc_url, tmp_path):
             return jsonify({'error': f'Failed to download document from URL: {doc_url}'}), 500
@@ -265,7 +296,6 @@ def run_hackrx():
 
         logging.info(f"Processing completed. Memory: {get_memory_usage():.1f}MB")
 
-        # Create retriever with memory monitoring
         retriever = MemoryEfficientRetriever(document_chunks)
         if retriever.embeddings is None:
             return jsonify({'error': 'Failed to generate document embeddings.'}), 500
@@ -274,42 +304,35 @@ def run_hackrx():
 
         answer_engine = OptimizedAnsweringEngine(GEMINI_MODEL)
         
-        # Process questions with limited parallelism for memory control
-        max_workers = min(3, len(questions))  # Limit concurrent threads
+        # Process questions sequentially to avoid rate limits
         answers = []
-        
-        # Split questions into smaller batches
-        batch_size = 5
-        for i in range(0, len(questions), batch_size):
-            batch_questions = questions[i:i+batch_size]
-            
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [
-                    executor.submit(answer_engine.get_answer, q, retriever.get_relevant_context(q))
-                    for q in batch_questions
-                ]
+        for i, question in enumerate(questions):
+            try:
+                logging.info(f"Processing question {i+1}/{len(questions)}: {question[:50]}...")
+                context = retriever.get_relevant_context(question)
+                answer = answer_engine.get_answer(question, context)
+                answers.append(answer)
                 
-                for future in futures:
-                    try:
-                        answer = future.result(timeout=30)
-                        answers.append(answer)
-                    except Exception as exc:
-                        logging.error(f"Question processing error: {exc}")
-                        answers.append(f"Error: {str(exc)[:50]}")
+                # Add small delay between questions
+                if i < len(questions) - 1:  # Don't sleep after last question
+                    time.sleep(1)  # 1 second delay between questions
+                    
+            except Exception as e:
+                logging.error(f"Error processing question {i+1}: {e}")
+                answers.append(f"Error processing question: {str(e)[:50]}")
             
-            # Clean up between batches
             gc.collect()
-            logging.info(f"Batch {i//batch_size + 1} completed. Memory: {get_memory_usage():.1f}MB")
         
         total_time = time.time() - start_time
         final_memory = get_memory_usage()
         
-        logging.info(f"All questions processed in {total_time:.2f}s. Peak memory: {final_memory:.1f}MB")
+        logging.info(f"All questions processed in {total_time:.2f}s. Memory: {final_memory:.1f}MB")
         
         return jsonify({
             'answers': answers,
             'processing_time': f"{total_time:.2f}s",
-            'memory_used': f"{final_memory:.1f}MB"
+            'memory_used': f"{final_memory:.1f}MB",
+            'questions_processed': len(answers)
         })
 
     except Exception as e:
@@ -318,11 +341,8 @@ def run_hackrx():
         return jsonify({'error': f'Internal server error: {str(e)[:100]}'}), 500
     
     finally:
-        # Cleanup
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-        
-        # Force garbage collection
         gc.collect()
         logging.info("Cleanup completed")
 
