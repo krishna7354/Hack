@@ -1,6 +1,5 @@
 Flask
-flask-cors
-google-generativeai
+Flask-Cors
 numpy
 PyPDF2
 requests
